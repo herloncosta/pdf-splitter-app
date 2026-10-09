@@ -7,6 +7,12 @@ node_modules/
 
 # Testing
 coverage/
+test-results/
+playwright-report/
+playwright/.cache/
+
+# TS build info
+tsconfig.tsbuildinfo
 
 # OS / Editor
 .DS_Store

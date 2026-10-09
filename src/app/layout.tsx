@@ -12,6 +12,10 @@ export default function RootLayout({
 }: {
   children: React.ReactNode;
 }) {
+  // Nota (T51): sem <meta CSP> restritivo de propósito — o Next.js (mesmo em
+  // `output: 'export'`) emite scripts inline e o `script-src 'self'` quebra a
+  // hidratação. Privacidade é garantida por arquitetura (zero fetch/XHR para
+  // hosts externos, verificado no E2E) + selo no footer.
   return (
     <html lang="pt-BR">
       <body className="min-h-screen bg-zinc-50 text-zinc-900 antialiased">
