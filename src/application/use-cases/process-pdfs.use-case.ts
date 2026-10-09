@@ -1,6 +1,5 @@
 import { OutputPrefix, buildPartName } from "@/domain/value-objects/output-prefix";
 import { SizeLimit } from "@/domain/value-objects/size-limit";
-import { planSplit } from "@/domain/services/split-planner";
 import {
   CorruptPdfError,
   EncryptedPdfError,
@@ -18,7 +17,6 @@ import {
 interface FlatPage {
   handle: PdfHandle;
   pageIndex: number;
-  size: number;
 }
 
 export async function yieldToEventLoop(): Promise<void> {
@@ -28,12 +26,27 @@ export async function yieldToEventLoop(): Promise<void> {
 function report(monotonic: { last: number }, cb: ProgressCallback | undefined, p: number) {
   if (!cb) return;
   const v = Math.max(0, Math.min(100, Math.round(p)));
-  if (v >= monotonic.last) {
+  if (v > monotonic.last) {
     monotonic.last = v;
     cb(v);
   }
 }
 
+/**
+ * Preenchimento guloso com medição real sobre builds íntegros (maximiza o limite).
+ *
+ * Duas armadilhas do pdf-lib que este algoritmo evita (ambas medidas):
+ * 1. Estimar somando páginas salvas isoladas conta recursos compartilhados
+ *    (fontes/imagens) 1x por página → corta cedo demais (partes <1MB).
+ * 2. `copyPages` página-a-página em chamadas SEPARADAS duplica o recurso
+ *    compartilhado no destino (medido: 10 págs c/ 1 imagem = 45KB real vs
+ *    436KB copiando separado, ~10x) → mediria um documento inchado.
+ *
+ * Por isso cada tentativa reconstrói [cursor, end) do zero com cópias em
+ * LOTE (runs consecutivas por origem) e a decisão usa o `save()` DESSE
+ * build íntegro. Cada parte não-final é maximal: a próxima página de fato
+ * excederia o limite.
+ */
 export async function processPdfs(
   input: ProcessPdfsInput,
   gateway: IPdfGateway,
@@ -78,72 +91,70 @@ export async function processPdfs(
     return { parts: [], skipped };
   }
 
-  // 2. Achata páginas com estimativa individual (1 save por página, nunca O(n²) do doc inteiro)
+  // 2. Lista plana de páginas na ordem das fontes (sem nenhuma estimativa)
   const flat: FlatPage[] = [];
   for (const doc of loaded) {
-    for (let p = 0; p < doc.pageCount; p++) {
-      flat.push({ handle: doc.handle, pageIndex: p, size: await gateway.getSinglePageSize(doc.handle, p) });
-    }
+    for (let p = 0; p < doc.pageCount; p++) flat.push({ handle: doc.handle, pageIndex: p });
   }
 
-  // 3. Plano puro de corte (domínio, sem I/O)
-  const plan = planSplit(flat.map((f) => f.size), limit.bytes);
-  const oversized = new Set(plan.oversizedIndices);
-
-  // 4. Materializa cada parte (agrupa cópias por handle de origem)
+  // 3. Fill guloso: expande a fronteira, rebuild em lote, mede, decide
   const parts: ProcessPdfsResult["parts"] = [];
-  for (let pi = 0; pi < plan.parts.length; pi++) {
-    const indices = plan.parts[pi];
-    const dest = await gateway.createDocument();
+  const totalPages = flat.length;
+  let cursor = 0;
 
-    let cursor = 0;
-    while (cursor < indices.length) {
-      const h = flat[indices[cursor]].handle;
-      const batch: number[] = [];
-      while (cursor < indices.length && flat[indices[cursor]].handle === h) {
-        batch.push(flat[indices[cursor]].pageIndex);
-        cursor++;
-      }
-      await gateway.copyPages(h, batch, dest);
-    }
-
-    let data = await gateway.save(dest);
-    let pages = [...indices];
-
-    // Verificação + bisseção de segurança: estimativa pode divergir do save real
-    let guard = 0;
-    while (data.length > limit.bytes && pages.length > 1 && guard++ < 10) {
-      const half = Math.ceil(pages.length / 2);
-      const firstHalf = pages.slice(0, half);
-      pages = firstHalf;
-      const retry = await gateway.createDocument();
-      let c = 0;
-      while (c < pages.length) {
-        const h = flat[pages[c]].handle;
-        const batch: number[] = [];
-        while (c < pages.length && flat[pages[c]].handle === h) {
-          batch.push(flat[pages[c]].pageIndex);
-          c++;
-        }
-        await gateway.copyPages(h, batch, retry);
-      }
-      data = await gateway.save(retry);
-      // páginas restantes voltam como nova parte logo após esta
-      const rest = indices.slice(pages.length);
-      if (rest.length > 0) plan.parts.splice(pi + 1, 0, rest);
-      break; // uma bisseção basta; resto é reprocessado como parte seguinte
-    }
-
+  const pushPart = (data: Uint8Array, pageCount: number, oversized: boolean) =>
     parts.push({
       name: buildPartName(prefix, parts.length + 1),
       data,
       sizeBytes: data.length,
-      pageCount: pages.length,
-      oversized: pages.length === 1 && oversized.has(pages[0]),
+      pageCount,
+      oversized,
     });
 
-    report(prog, onProgress, 30 + ((pi + 1) / plan.parts.length) * 70);
-    await yieldToEventLoop();
+  /** Reconstrói [start, end) com UMA chamada copyPages por run consecutiva. */
+  async function buildRange(start: number, end: number): Promise<PdfHandle> {
+    const dest = await gateway.createDocument();
+    let i = start;
+    while (i < end) {
+      const h = flat[i].handle;
+      const batch: number[] = [];
+      while (i < end && flat[i].handle === h) {
+        batch.push(flat[i].pageIndex);
+        i++;
+      }
+      await gateway.copyPages(h, batch, dest);
+    }
+    return dest;
+  }
+
+  while (cursor < totalPages) {
+    let end = cursor;
+    let lastGoodBytes: Uint8Array | null = null;
+    let lastGoodEnd = cursor;
+    let trialBytes: Uint8Array | null = null;
+
+    while (end < totalPages) {
+      end += 1;
+      trialBytes = await gateway.save(await buildRange(cursor, end));
+      if (trialBytes.length <= limit.bytes) {
+        lastGoodBytes = trialBytes;
+        lastGoodEnd = end;
+      } else {
+        break;
+      }
+      report(prog, onProgress, 30 + (end / totalPages) * 70);
+      await yieldToEventLoop();
+    }
+
+    if (lastGoodEnd === cursor) {
+      // Nem a primeira página coube: trialBytes é o build [cursor, cursor+1)
+      // que estourou sozinho → entrega sinalizada, sem loop.
+      pushPart(trialBytes!, 1, true);
+      cursor += 1;
+    } else {
+      pushPart(lastGoodBytes!, lastGoodEnd - cursor, false);
+      cursor = lastGoodEnd;
+    }
   }
 
   report(prog, onProgress, 100);

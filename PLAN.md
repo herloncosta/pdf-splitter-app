@@ -75,6 +75,18 @@ pdf-splitter-app/
 
 Problemas da v1 corrigidos: (1) sem `mergedPdf` intermediário gigante, (2) sem `save()` por página, (3) página única estourada sinalizada.
 
+> Revisão pós-teste real (2 rodadas):
+> 1. Medir o `save()` real após cada página maximiza o limite — estimar
+>    somando páginas salvas isoladas conta recursos compartilhados (fontes
+>    embedadas etc.) uma vez por página e corta cedo demais (partes <1MB).
+>    `getSinglePageSize` foi removido do Port/adapters.
+> 2. MAS medir não basta: `copyPages` página-a-página em chamadas separadas
+>    DUPLICA o compartilhado no destino (medido: 10 págs c/ 1 imagem = 45KB
+>    real vs 436KB, ~10x) — media um documento inchado e ainda gerava
+>    arquivos maiores que o necessário. Cada tentativa reconstrói
+>    [cursor, end) do zero com cópias em LOTE (1 chamada por run
+>    consecutiva) e a decisão usa o `save()` desse build íntegro.
+
 ```typescript
 // domain/value-objects/size-limit.ts
 export const SAFE_3MB_BYTES = 2_800_000; // bytes decimais, não MiB. Portal de 3.000.000 -> margem 200KB
@@ -93,11 +105,12 @@ export async function processPdfs(
   onProgress?: (p: number) => void,
 ): Promise<PdfPart[]> {
   // 1. load com try/catch por arquivo -> EncryptedPdfError | CorruptPdfError (não aborta fila, marca erro)
-  // 2. itera páginas fonte -> destino sem mergedPdf: mantém `current: WritableDoc`
-  // 3. estratégia de save com backoff: só serializa a cada K páginas (ex: 5) ou quando estimate > 80% do limite
-  // 4. se save > limite && pagesInCurrent > 1 -> fecha parte sem última página, abre nova com ela
+  // 2. lista plana de páginas na ordem, sem mergedPdf: mantém `current` por parte
+  // 3. fill guloso com MEDIÇÃO REAL: anexa 1 página -> save() -> mede (nunca estimativa)
+  // 4. se save > limite && pagesInCurrent > 1 -> fecha parte sem última página (lastGood), nova parte começa com ela
   // 5. se save > limite && pagesInCurrent === 1 -> fecha parte com oversized: true (UI alerta)
-  // 6. yield ao event loop a cada iteração para progresso fluido + Worker
+  // 6. invariante: cada parte não-final é maximal (a próxima página de fato excederia)
+  // 7. yield ao event loop a cada iteração para progresso fluido + Worker
 }
 ```
 

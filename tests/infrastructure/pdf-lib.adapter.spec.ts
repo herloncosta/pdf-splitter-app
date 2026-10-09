@@ -26,11 +26,8 @@ describe("PdfLibGatewayAdapter (T30)", () => {
     expect(gw.getPageCount(h2)).toBe(2);
   });
 
-  it("estima tamanho de página isolada", async () => {
+  it("probePageCount sem carregar o documento inteiro no gateway", async () => {
     const gw = new PdfLibGatewayAdapter();
-    const h = await gw.loadDocument(await makePdfBytes(3), "A.pdf");
-    const s = await gw.getSinglePageSize(h, 0);
-    expect(s).toBeGreaterThan(0);
     expect(await gw.probePageCount(await makePdfBytes(3), "A.pdf")).toBe(3);
   });
 

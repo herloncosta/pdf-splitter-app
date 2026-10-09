@@ -42,14 +42,6 @@ export class PdfLibGatewayAdapter implements IPdfGateway {
     return this.get(handle).getPageCount();
   }
 
-  async getSinglePageSize(handle: PdfHandle, pageIndex: number): Promise<number> {
-    const src = this.get(handle);
-    const single = await PDFDocument.create();
-    const [p] = await single.copyPages(src, [pageIndex]);
-    single.addPage(p);
-    return (await single.save()).length;
-  }
-
   async copyPages(src: PdfHandle, srcIndices: number[], dest: PdfHandle): Promise<void> {
     const s = this.get(src);
     const d = this.get(dest);

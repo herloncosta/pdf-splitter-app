@@ -23,6 +23,8 @@ class FakePdfGateway implements IPdfGateway {
   private failures = new Map<string, "encrypted" | "corrupt">();
   private seq = 0;
   copyCalls: { fileName: string; indices: number[] }[] = [];
+  /** Snapshot do conteúdo do destino a cada save (para assert de ordem). */
+  savedSnapshots: number[][] = [];
 
   registerFile(fileName: string, pageSizes: number[]) {
     this.files.set(fileName, [...pageSizes]);
@@ -55,10 +57,6 @@ class FakePdfGateway implements IPdfGateway {
     return this.docs.get(handle)!.length;
   }
 
-  async getSinglePageSize(handle: PdfHandle, pageIndex: number): Promise<number> {
-    return this.docs.get(handle)![pageIndex] + DOC_OVERHEAD;
-  }
-
   async copyPages(src: PdfHandle, srcIndices: number[], dest: PdfHandle): Promise<void> {
     const s = this.docs.get(src)!;
     const d = this.docs.get(dest)!;
@@ -68,6 +66,7 @@ class FakePdfGateway implements IPdfGateway {
 
   async save(handle: PdfHandle): Promise<Uint8Array> {
     const pages = this.docs.get(handle)!;
+    this.savedSnapshots.push([...pages]);
     const sum = pages.reduce((a, b) => a + b, 0);
     return new Uint8Array(sum + DOC_OVERHEAD);
   }
@@ -102,11 +101,12 @@ describe("ProcessPdfsUseCase (T21)", () => {
     expect(r.parts).toHaveLength(1);
     expect(r.parts[0].pageCount).toBe(3);
     expect(r.parts[0].name).toBe("Doc_Parte_01.pdf");
-    // ordem materializada: A[0,1] depois B[0]
-    expect(gw.copyCalls).toEqual([
-      { fileName: "A.pdf", indices: [0, 1] },
-      { fileName: "B.pdf", indices: [0] },
-    ]);
+    // ordem materializada: o último save contém A[100,200] + B[300] nessa ordem
+    expect(gw.savedSnapshots[gw.savedSnapshots.length - 1]).toEqual([100, 200, 300]);
+    // e cada tentativa reconstrói em lote (1 chamada por run consecutiva),
+    // nunca página-a-página em sequência (isso duplicaria compartilhados)
+    const batched = gw.copyCalls.filter((c) => c.fileName === "A.pdf" && c.indices.join(",") === "0,1");
+    expect(batched.length).toBeGreaterThan(0);
   });
 
   it("corta respeitando o limite", async () => {
@@ -126,6 +126,30 @@ describe("ProcessPdfsUseCase (T21)", () => {
     expect(r.parts[0].pageCount).toBe(2);
     expect(r.parts[1].pageCount).toBe(1);
     for (const p of r.parts) expect(p.sizeBytes).toBeLessThanOrEqual(2_800_000);
+    expect(r.parts[0].oversized).toBe(false);
+  });
+
+  it("preenche cada parte até o limite real (medição, não estimativa)", async () => {
+    const gw = new FakePdfGateway();
+    gw.registerFile("A.pdf", [1 * MB, 1 * MB, 0.5 * MB]);
+
+    const r = await processPdfs(
+      {
+        sources: [{ id: "a", fileName: "A.pdf", data: bytes(10) }],
+        maxSizeBytes: 2_500_000,
+        outputPrefix: "Doc",
+      },
+      gw,
+    );
+
+    // save real: 1M+100, 2M+100, 2.5M+100 → parte 1 com 2 págs (maximal),
+    // parte 2 com o resto. Estimativa por página isolada cortaria antes.
+    expect(r.parts).toHaveLength(2);
+    expect(r.parts[0].pageCount).toBe(2);
+    expect(r.parts[0].sizeBytes).toBe(2 * MB + DOC_OVERHEAD);
+    // maximal: a próxima página (0.5MB) NÃO caberia na parte 1
+    expect(r.parts[0].sizeBytes - DOC_OVERHEAD + 0.5 * MB + DOC_OVERHEAD).toBeGreaterThan(2_500_000);
+    expect(r.parts[1].pageCount).toBe(1);
     expect(r.parts[0].oversized).toBe(false);
   });
 
